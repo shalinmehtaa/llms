@@ -21,7 +21,7 @@ def timer(description: str):
     print(f"{description}: {end - start:.3f} seconds")
 
 
-class BPETokenizer:
+class BPETrainer:
     """An efficient implementation of the Byte Pair Encoding tokenization algorithm"""
     
     def __init__(self, vocab_size: int, special_tokens: List[str]):
@@ -43,19 +43,22 @@ class BPETokenizer:
         return [(pretoken[i], pretoken[i+1]) for i in range(len(pretoken)-1)]
     
     def _build_pair_index(self, 
-                          pretokens: List[List[int]]) -> Tuple[Dict[Tuple[int, int], int],
-                                                               Dict[Tuple[int, int], set]]:
-        """Count token pairs for each pretoken and maintain an index of pairs mapped to pretokens where they occur"""
+                          pretokens: List[List[int]],
+                          freqs: List[int]) -> Tuple[Dict[Tuple[int, int], int],
+                                                     Dict[Tuple[int, int], set]]:
+        """Count token pairs for each unique pretoken weighted by frequency, and build index of pairs to pretokens."""
         pair_counts = Counter()
         pair_index: Dict[Tuple[int, int], set] = defaultdict(set)
         
-        for idx, pretoken in tqdm(enumerate(pretokens), total=len(pretokens), desc="Indexing pairs"):
+        for idx, (pretoken, freq) in tqdm(enumerate(zip(pretokens, freqs)), 
+                                          total=len(pretokens), 
+                                          desc="Indexing pairs"):
             pairs = self._pairs_in(pretoken)
             if not pairs:
                 continue
-            pair_counts.update(pairs)
-            # set() to avoid multiple adds of same idx for same pair
-            for p in set(pairs):
+            local_counts = Counter(pairs)
+            for p, c in local_counts.items():
+                pair_counts[p] += c * freq
                 pair_index[p].add(idx)
         
         return dict(pair_counts), pair_index
@@ -111,14 +114,15 @@ class BPETokenizer:
                                  old_pairs: List[Tuple[int, int]], 
                                  new_pairs: List[Tuple[int, int]],
                                  pretoken_idx: int,
+                                 freq: int,
                                  pair_counts: Dict[Tuple[int, int], int],
                                  pair_index: Dict[Tuple[int, int], set]):
-        """Incrementally update the pair counts and pair index; important for speed-up"""
+        """Incrementally update the pair counts (weighted by freq) and pair index; important for speed-up"""
         # Update global pair counts: remove all old pairs from this pretoken, add all new pairs
         if old_pairs:
             counts_old = Counter(old_pairs)
             for pair, count in counts_old.items():
-                global_counts_left = pair_counts.get(pair, 0) - count
+                global_counts_left = pair_counts.get(pair, 0) - count * freq
                 if global_counts_left > 0:
                     pair_counts[pair] = global_counts_left
                 else:
@@ -126,7 +130,7 @@ class BPETokenizer:
         if new_pairs:
             counts_new = Counter(new_pairs)
             for pair, count in counts_new.items():
-                pair_counts[pair] = pair_counts.get(pair, 0) + count
+                pair_counts[pair] = pair_counts.get(pair, 0) + count * freq
 
         # Update global index: drop idx from pairs no longer present; add for new pairs
         old_set = set(old_pairs)
@@ -145,18 +149,8 @@ class BPETokenizer:
         return pair_counts, pair_index
     
     def train(self, 
-              pretokens: List[List[bytes]],
-              max_workers: int) -> Tuple[Dict[int, bytes], List[bytes]]:
+              pretokens: List[bytes]) -> Tuple[Dict[int, bytes], List[bytes]]:
         """Run the training algorithm"""
-        # Convert to integers for easier downstream processing
-        # with Pool(max_workers) as p:
-        #     pretokens = list(tqdm(
-        #         p.imap(list, pretokens, chunksize=10_000), 
-        #         total=len(pretokens),
-        #         desc="Converting pretoken bytes to int"
-        #     )
-        # )
-
         # Initialize vocabulary
         vocab = {i: bytes([i]) for i in range(256)}
 
@@ -166,8 +160,13 @@ class BPETokenizer:
             vocab[next_token_id] = special_token.encode("utf-8")
             next_token_id +=1
 
-        # Get initial byte pair counts and index
-        pair_counts, pair_index = self._build_pair_index(pretokens)
+        # Aggregate identical pretokens to reduce work
+        pretoken_freqs = Counter(pretokens)
+        pretokens_unique = list(pretoken_freqs.keys())   # bytes objects
+        freqs = [pretoken_freqs[p] for p in pretokens_unique]
+
+        # Get initial weighted byte pair counts and index
+        pair_counts, pair_index = self._build_pair_index(pretokens_unique, freqs)
 
         merges: List[Tuple[bytes, bytes]] = list()
 
@@ -192,9 +191,9 @@ class BPETokenizer:
             merged_token = vocab[left_token] + vocab[right_token]
             vocab[next_token_id] = merged_token
 
-            # For each affected pretoken, remerge and update counts+index
+            # For each affected unique pretoken, remerge and update counts+index
             for pretoken_idx in affected:
-                old_pretoken = pretokens[pretoken_idx]
+                old_pretoken = pretokens_unique[pretoken_idx]
                 old_pairs = self._pairs_in(old_pretoken)
 
                 new_pretoken, changed = self._merge_all_occurrences(old_pretoken, 
@@ -204,12 +203,13 @@ class BPETokenizer:
                 if not changed:
                     continue
 
-                pretokens[pretoken_idx] = new_pretoken
+                pretokens_unique[pretoken_idx] = new_pretoken
                 new_pairs = self._pairs_in(new_pretoken)
 
                 pair_counts, pair_index = self._update_counts_and_index(old_pairs, 
                                                                         new_pairs,
                                                                         pretoken_idx,
+                                                                        freqs[pretoken_idx],
                                                                         pair_counts,
                                                                         pair_index)
 
@@ -248,8 +248,8 @@ def main(file_path: str,
             print(f"Warning: Could not read special tokens from {special_tokens_path}: {e}")
 
     with timer("BPE training time"):
-        bpe = BPETokenizer(vocab_size, special_tokens)
-        vocab, merges = bpe.train(pretokens, max_workers)
+        bpe = BPETrainer(vocab_size, special_tokens)
+        vocab, merges = bpe.train(pretokens)
     
     return vocab, merges
 
