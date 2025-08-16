@@ -37,21 +37,31 @@ def get_pretokenization_tasks(file_path: str,
 
 
 def pretokenize_chunk(chunk: str,
-                      special_tokens: str) -> List[bytes]:
+                      special_tokens: Optional[List[str]] = None,
+                      training: Optional[bool] = True) -> List[bytes]:
     """Pretokenize a chunk of text"""
-    # Working with strings since regex and other operations below work better with strings
     assert type(chunk) == str, "chunk must be str type"
-    assert all(isinstance(token, str) for token in special_tokens), "all special tokens must be str type"
-    
-    # Start by splitting on special tokens
-    pattern = ("|".join(map(regex.escape, special_tokens)))
-    segments = regex.split(pattern, chunk)
 
-    pretokens = list()
+    if special_tokens:
+        assert all(isinstance(token, str) for token in special_tokens), "all special tokens must be str type"
+        if not training:
+            sorted_special = sorted(special_tokens, key=len, reverse=True)
+            pattern = "(" + "|".join(map(regex.escape, sorted_special)) + ")"
+        else:
+            pattern = "|".join(map(regex.escape, special_tokens))
+        segments = regex.split(pattern, chunk)
+    else:
+        segments = [chunk]
+
+    pretokens: List[bytes] = []
     for segment in segments:
-        for match in regex.finditer(PAT_COMPILED, segment):
-            # Return pretokens as bytes
-            pretokens.append(match.group().encode("utf-8"))
+        if not segment:
+            continue
+        if special_tokens and segment in special_tokens:
+            pretokens.append(segment.encode("utf-8"))
+        else:
+            for match in regex.finditer(PAT_COMPILED, segment):
+                pretokens.append(match.group().encode("utf-8"))
 
     return pretokens
 

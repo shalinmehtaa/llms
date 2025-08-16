@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from collections import defaultdict, Counter
 from typing import List, Dict, Tuple, Optional
 
-from .pretokenization import pretokenize
+from ..pretokenization import pretokenize
 
 
 # Context manager for timing specific sections
@@ -21,7 +21,7 @@ def timer(description: str):
     print(f"{description}: {end - start:.3f} seconds")
 
 
-class BPETrainer:
+class Trainer:
     """An efficient implementation of the Byte Pair Encoding tokenization algorithm"""
     
     def __init__(self, vocab_size: int, special_tokens: List[str]):
@@ -248,7 +248,7 @@ def main(file_path: str,
             print(f"Warning: Could not read special tokens from {special_tokens_path}: {e}")
 
     with timer("BPE training time"):
-        bpe = BPETrainer(vocab_size, special_tokens)
+        bpe = Trainer(vocab_size, special_tokens)
         vocab, merges = bpe.train(pretokens)
     
     return vocab, merges
