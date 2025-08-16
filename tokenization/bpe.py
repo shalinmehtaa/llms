@@ -1,10 +1,31 @@
+import time
+import json
+import pstats
+import cProfile
+import argparse
+from tqdm.auto import tqdm
+from multiprocessing import Pool
+from contextlib import contextmanager
+from collections import defaultdict, Counter
 from typing import List, Dict, Tuple, Optional
+
 from .pretokenization import pretokenize
+
+
+# Context manager for timing specific sections
+@contextmanager
+def timer(description: str):
+    start = time.perf_counter()
+    yield
+    end = time.perf_counter()
+    print(f"{description}: {end - start:.3f} seconds")
+
 
 class BPETokenizer:
     """An efficient implementation of the Byte Pair Encoding tokenization algorithm"""
+    
     def __init__(self, vocab_size: int, special_tokens: List[str]):
-        
+        """Initialize the class"""
         self.vocab_size = vocab_size
         self.special_tokens = special_tokens
 
@@ -13,50 +34,36 @@ class BPETokenizer:
 
         if self.num_merges < 0:
             raise ValueError("vocab_size must be greater than 256 + the number of special tokens")
-
-    def _get_pair_counts(self, pretokens: List[List[int]]) -> Dict[Tuple[int, int], int]:
-        """Get byte pair counts for each pretoken during a first pass of the data"""
-        pair_counts = dict()
-        # Working with integers here
-        for pretoken in pretokens:
-            for left_id, right_id in zip(pretoken[:-1], pretoken[1:]):
-                pair_counts[(left_id, right_id)] = pair_counts.get((left_id, right_id), 0) + 1
-
-        return pair_counts
+        
+    def _pairs_in(self, pretoken: List[int]) -> List[Tuple[int, int]]:
+        """Get the token pairs in a list of tokens"""
+        if len(pretoken) < 2:
+            return []
+        # List of pairs
+        return [(pretoken[i], pretoken[i+1]) for i in range(len(pretoken)-1)]
     
-    def _get_incremental_pair_counts(self,
-                                     pair_counts: Dict[Tuple[int, int], int],
-                                     old_pretokens: List[List[int]],
-                                     new_pretokens: List[List[int]],
-                                     max_count_pair: Tuple[int, int]) -> Dict[Tuple[int, int], int]:
-        """Incrementally updated pair counts by only modifying counts for pretokens with the merged pair."""
-        # Creat copy to store new counts
-        updated_counts = pair_counts.copy()
-
-        for old_pretoken, new_pretoken in zip(old_pretokens, new_pretokens):
-            # Pretoken hasn't changed, skip updating counts
-            if old_pretoken == new_pretoken:
+    def _build_pair_index(self, 
+                          pretokens: List[List[int]]) -> Tuple[Dict[Tuple[int, int], int],
+                                                               Dict[Tuple[int, int], set]]:
+        """Count token pairs for each pretoken and maintain an index of pairs mapped to pretokens where they occur"""
+        pair_counts = Counter()
+        pair_index: Dict[Tuple[int, int], set] = defaultdict(set)
+        
+        for idx, pretoken in tqdm(enumerate(pretokens), total=len(pretokens), desc="Indexing pairs"):
+            pairs = self._pairs_in(pretoken)
+            if not pairs:
                 continue
-            
-            # Remove counts for merged pair based if found in old pretokens
-            for left_id, right_id in zip(old_pretoken[:-1], old_pretoken[1:]):
-                pair = (left_id, right_id)
-                if pair in updated_counts:
-                    updated_counts[pair] -= 1
-                    if updated_counts[pair] == 0:
-                        del updated_counts[pair]
-
-            # Add counts for merged token if found in new pretokens
-            for left_id, right_id in zip(new_pretoken[:-1], new_pretoken[1:]):
-                pair = (left_id, right_id)
-                updated_counts[pair] = \
-                    updated_counts.get(pair, 0) + 1
-
-        return updated_counts
+            pair_counts.update(pairs)
+            # set() to avoid multiple adds of same idx for same pair
+            for p in set(pairs):
+                pair_index[p].add(idx)
+        
+        return dict(pair_counts), pair_index
             
     def _get_pair_with_max_count(self, 
                                 pair_counts: Dict[Tuple[int, int], int],
                                 vocab: Dict[int, bytes]) -> Tuple[int, int]:
+        """Get the pair with max counts; break ties with lexicographically greater pair"""
         max_count = max(pair_counts.values())
         max_count_pairs = [
             pair for pair, count in pair_counts.items() if count == max_count
@@ -75,30 +82,80 @@ class BPETokenizer:
         
         return max_count_pair
 
-    def _apply_merge(self, 
-                     pretokens: List[List[int]], 
-                     next_token_id: int,
-                     max_count_pair: Tuple[int, int]) -> List[List[int]]:
-        """Recursively merge all occurrences of the pair."""
-        def merge_recursively(pretoken: List[int]):
-            # Nothing to merge
-            if len(pretoken) < 2:
-                return pretoken
-            
-            # Working with integers here
-            for i in range(len(pretoken) - 1):
-                if pretoken[i] == max_count_pair[0] and pretoken[i+1] == max_count_pair[1]:
-                    before = pretoken[:i]
-                    after = pretoken[i+2:]
-                    return before + [next_token_id] + merge_recursively(after)
-                
-            return pretoken # List of integers
+    def _merge_all_occurrences(self, 
+                               pretoken: List[int],
+                               left_token: int, 
+                               right_token: int, 
+                               next_token_id: int) -> Tuple[List[int], bool]:
+        """Apply merges to pretokens that have the pair with the max counts"""
+        n = len(pretoken)
 
-        return [merge_recursively(pretoken) for pretoken in pretokens]
+        if n < 2:
+            return pretoken, False
+        
+        out = list()
+        i = 0
+        changed = False
+        while i < n:
+            if i + 1 < n and pretoken[i] == left_token and pretoken[i+1] == right_token:
+                out.append(next_token_id)
+                i += 2
+                changed = True
+            else:
+                out.append(pretoken[i])
+                i += 1
+
+        return out, changed
+
+    def _update_counts_and_index(self,
+                                 old_pairs: List[Tuple[int, int]], 
+                                 new_pairs: List[Tuple[int, int]],
+                                 pretoken_idx: int,
+                                 pair_counts: Dict[Tuple[int, int], int],
+                                 pair_index: Dict[Tuple[int, int], set]):
+        """Incrementally update the pair counts and pair index; important for speed-up"""
+        # Update global pair counts: remove all old pairs from this pretoken, add all new pairs
+        if old_pairs:
+            counts_old = Counter(old_pairs)
+            for pair, count in counts_old.items():
+                global_counts_left = pair_counts.get(pair, 0) - count
+                if global_counts_left > 0:
+                    pair_counts[pair] = global_counts_left
+                else:
+                    pair_counts.pop(pair, None)
+        if new_pairs:
+            counts_new = Counter(new_pairs)
+            for pair, count in counts_new.items():
+                pair_counts[pair] = pair_counts.get(pair, 0) + count
+
+        # Update global index: drop idx from pairs no longer present; add for new pairs
+        old_set = set(old_pairs)
+        new_set = set(new_pairs)
+
+        for pair in old_set - new_set:
+            s = pair_index.get(pair)
+            if s is not None:
+                s.discard(pretoken_idx)
+                if not s:
+                    pair_index.pop(pair, None)
+
+        for pair in new_set:
+            pair_index.setdefault(pair, set()).add(pretoken_idx)
+
+        return pair_counts, pair_index
     
-
     def train(self, 
-              pretokens: List[List[int]]) -> Tuple[Dict[int, bytes], List[bytes]]:
+              pretokens: List[List[bytes]],
+              max_workers: int) -> Tuple[Dict[int, bytes], List[bytes]]:
+        """Run the training algorithm"""
+        # Convert to integers for easier downstream processing
+        # with Pool(max_workers) as p:
+        #     pretokens = list(tqdm(
+        #         p.imap(list, pretokens, chunksize=10_000), 
+        #         total=len(pretokens),
+        #         desc="Converting pretoken bytes to int"
+        #     )
+        # )
 
         # Initialize vocabulary
         vocab = {i: bytes([i]) for i in range(256)}
@@ -108,75 +165,192 @@ class BPETokenizer:
         for special_token in self.special_tokens:
             vocab[next_token_id] = special_token.encode("utf-8")
             next_token_id +=1
-        
-        # Get first pass byte pair counts across all text
-        pair_counts = self._get_pair_counts(pretokens)
 
-        # Initialize merges list
-        merges = list()
+        # Get initial byte pair counts and index
+        pair_counts, pair_index = self._build_pair_index(pretokens)
 
-        for _ in range(self.num_merges):
+        merges: List[Tuple[bytes, bytes]] = list()
 
-            max_count_pair = self._get_pair_with_max_count(
-                pair_counts=pair_counts,
-                vocab=vocab
-            )
-
-            # Add pair to merges as bytes
-            merges.append((
-                vocab[max_count_pair[0]],
-                vocab[max_count_pair[1]]
-            ))
-
-            # Merge the bytes to mint a new token and add to vocab
-            merged_token = vocab[max_count_pair[0]] + vocab[max_count_pair[1]]
-            vocab[next_token_id] = merged_token
+        for _ in tqdm(range(self.num_merges), desc="Merging"):
             
-            old_pretokens = pretokens
-            pretokens  = self._apply_merge(
-                pretokens=pretokens,
-                next_token_id=next_token_id,
-                max_count_pair=max_count_pair
-            )
+            if not pair_counts:
+                break
 
-            pair_counts = self._get_incremental_pair_counts(
-                pair_counts=pair_counts,
-                old_pretokens=old_pretokens,
-                new_pretokens=pretokens,
-                max_count_pair=max_count_pair
-            )
+            max_pair = self._get_pair_with_max_count(pair_counts, vocab)
+            
+            left_token, right_token = max_pair
 
-            # Increment the token ID
+            affected = list(pair_index.get(max_pair, ()))
+            # No more occurrences; remove and continue
+            if not affected:
+                pair_counts.pop(max_pair, None)
+                pair_index.pop(max_pair, None)
+                continue
+
+            # Record merge and new token
+            merges.append((vocab[left_token], vocab[right_token]))
+            merged_token = vocab[left_token] + vocab[right_token]
+            vocab[next_token_id] = merged_token
+
+            # For each affected pretoken, remerge and update counts+index
+            for pretoken_idx in affected:
+                old_pretoken = pretokens[pretoken_idx]
+                old_pairs = self._pairs_in(old_pretoken)
+
+                new_pretoken, changed = self._merge_all_occurrences(old_pretoken, 
+                                                                    left_token, 
+                                                                    right_token, 
+                                                                    next_token_id)
+                if not changed:
+                    continue
+
+                pretokens[pretoken_idx] = new_pretoken
+                new_pairs = self._pairs_in(new_pretoken)
+
+                pair_counts, pair_index = self._update_counts_and_index(old_pairs, 
+                                                                        new_pairs,
+                                                                        pretoken_idx,
+                                                                        pair_counts,
+                                                                        pair_index)
+
+            # The merged pair should be fully consumed in processed pretokens
+            pair_counts.pop(max_pair, None)
+            pair_index.pop(max_pair, None)            
+
             next_token_id += 1
 
         return vocab, merges
-    
+
 
 def main(file_path: str,
-         special_tokens: List[str],
          vocab_size: int,
+         special_tokens_path: Optional[str] = None,
+         special_tokens: Optional[List[str]] = ["<|endoftext|>"],
          max_workers: Optional[int] = 8,
          num_chunks: Optional[int] = 8):
     """Pretokenize in chunks and then train a BPE tokenizer"""
-    pretokens = pretokenize(
-        file_path=file_path,
-        max_workers=max_workers,
-        num_chunks=num_chunks
-    )
-    # Convert to integers for easier downstream processing
-    pretokens = [list(pretoken) for pretoken in pretokens]
 
-    bpe = BPETokenizer(vocab_size, special_tokens)
-    vocab, merges = bpe.train(pretokens)
+    with timer("Pretokenization time"):
+        pretokens = pretokenize(
+            file_path=file_path,
+            max_workers=max_workers,
+            num_chunks=num_chunks,
+            special_tokens_path=special_tokens_path
+        )
+        print("Pretokenization complete.")
+
+    # Read special tokens here for BPE vocab
+    if special_tokens_path is not None:
+        try:
+            with open(special_tokens_path, "r") as special_tokens_file:
+                special_tokens = [line.strip() for line in special_tokens_file]
+        except Exception as e:
+            print(f"Warning: Could not read special tokens from {special_tokens_path}: {e}")
+
+    with timer("BPE training time"):
+        bpe = BPETokenizer(vocab_size, special_tokens)
+        vocab, merges = bpe.train(pretokens, max_workers)
     
     return vocab, merges
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--file_path",
+        "-f",
+        type=str,
+        required=True,
+        help="Path to the input text file used for training"
+    )
+    parser.add_argument(
+        "--vocab_size",
+        "-v",
+        type=int,
+        required=True,
+        help="Target vocabulary size (including bytes and special tokens)"
+    )
+    parser.add_argument(
+        "--special_tokens_path",
+        "-sp",
+        type=str,
+        required=False,
+        help="Path to the text file with special tokens (one per line)"
+    )
+    parser.add_argument(
+        "--max_workers", 
+        "-w",
+        type=int,
+        required=False,
+        help="Number of concurrent worker processes to use for pretokenization"
+    )
+    parser.add_argument(
+        "--num_chunks", 
+        "-n", 
+        type=int,
+        required=False,
+        help="Number of chunks to split the input text into"
+    )
+    parser.add_argument(
+        "--vocab_out_path",
+        "-vop",
+        type=str,
+        required=False,
+        default="data/vocab.json",
+        help="Output path for saving the vocab JSON"
+    )
+    parser.add_argument(
+        "--merges_out_path",
+        "-mop",
+        type=str,
+        required=False,
+        default="data/merges.txt",
+        help="Output path for saving the merges.txt"
+    )
+    parser.add_argument(
+        "--profile",
+        "-p",
+        action="store_true",
+        help="Enable profiling and save stats to bpe_profile.prof"
+    )
+    args = parser.parse_args()
 
-    with open("data/special_tokens.txt", "r") as special_tokens_file:
-        special_tokens = [line.strip() for line in special_tokens_file]
+    if args.profile:
+        profiler = cProfile.Profile()
+        profiler.enable()
+        vocab, merges = main(
+            file_path=args.file_path,
+            vocab_size=args.vocab_size,
+            special_tokens_path=args.special_tokens_path,
+            max_workers=args.max_workers,
+            num_chunks=args.num_chunks
+        )
+        profiler.disable()
+        profiler.dump_stats('bpe_profile.prof')
 
-    vocab, merges = main("data/TinyStoriesV2-GPT4-valid.txt", 
-                         special_tokens=special_tokens, 
-                         vocab_size=300)
+        stats = pstats.Stats('bpe_profile.prof')
+        print("\n=== TOP FUNCTIONS BY CUMULATIVE TIME ===")
+        stats.sort_stats('cumulative').print_stats(15)
+        print("\n=== TOP FUNCTIONS BY SELF TIME ===") 
+        stats.sort_stats('tottime').print_stats(15)
+    else:
+        vocab, merges = main(
+            file_path=args.file_path,
+            vocab_size=args.vocab_size,
+            special_tokens_path=args.special_tokens_path,
+            max_workers=args.max_workers,
+            num_chunks=args.num_chunks
+        )
+
+    vocab_serializable = {
+        v.decode("utf-8", errors="replace"): k for k, v in vocab.items()
+    }
+    with open(args.vocab_out_path, "w") as f:
+        json.dump(vocab_serializable, f, indent=2, ensure_ascii=False)
+
+    merge_lines = [
+        f"{merge[0].decode('utf-8', errors='replace')} {merge[1].decode('utf-8', errors='replace')}" 
+        for merge in merges
+    ]
+    with open(args.merges_out_path, "w") as f:
+        f.write("\n".join(merge_lines))

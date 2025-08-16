@@ -3,6 +3,7 @@ import argparse
 import multiprocessing as mp
 
 from pathlib import Path
+from tqdm.auto import tqdm
 from typing import List, Optional
 from concurrent.futures import ProcessPoolExecutor
 from .pretokenization_chunking import find_chunk_boundaries
@@ -86,7 +87,9 @@ def pretokenize(file_path: str,
         futures = [
             executor.submit(pretokenize_chunk, task, special_tokens) for task in tasks
         ]
-        results = [future.result() for future in futures]
+        results = [
+            future.result() for future in tqdm(futures, total=len(futures), desc="Pretokenizing chunks")
+        ]
 
     pretokens = [
         pretoken for chunk_pretokens in results for pretoken in chunk_pretokens
