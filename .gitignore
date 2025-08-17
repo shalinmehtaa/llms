@@ -174,8 +174,7 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-# Directories
-data/
-
-# Profiling
+# Text files
+*.txt
+*.npy*
 *.prof
