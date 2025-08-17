@@ -11,7 +11,7 @@ A Transformer implementation from scratch with a custom BPE tokenizer.
 ```bash
 uv sync
 ```
-- Main dependencies: PyTorch, einops, jaxtyping
+- Main dependencies: PyTorch, jaxtyping
 
 ### Usage
 
