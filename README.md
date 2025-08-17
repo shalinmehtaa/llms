@@ -1,6 +1,6 @@
 ## Scratchformer
 
-A modern Transformer implementation from scratch with a custom BPE tokenizer.
+A Transformer implementation from scratch with a custom BPE tokenizer.
 
 - **Transformer model**: Multi-head attention, SwiGLU, RMSNorm, RoPE
 - **BPE tokenizer**: Custom implementation with pretokenization and special token support
