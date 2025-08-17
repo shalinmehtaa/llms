@@ -1,4 +1,4 @@
-# Scratchformer
+## Scratchformer
 
 A modern Transformer implementation from scratch with a custom BPE tokenizer.
 
@@ -6,14 +6,14 @@ A modern Transformer implementation from scratch with a custom BPE tokenizer.
 - **BPE tokenizer**: Custom implementation with pretokenization and special token support
 - **Training setup**: Infrastructure for distributed training
 
-## Install
+### Install
 
 ```bash
 uv sync
 ```
 - Main dependencies: PyTorch, einops, jaxtyping
 
-## Usage
+### Usage
 
 ```python
 from transformer.model import Transformer
