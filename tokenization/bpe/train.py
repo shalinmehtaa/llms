@@ -1,5 +1,6 @@
 import time
 import json
+import base64
 import pstats
 import cProfile
 import argparse
@@ -292,20 +293,12 @@ if __name__ == "__main__":
         help="Number of chunks to split the input text into"
     )
     parser.add_argument(
-        "--vocab_out_path",
-        "-vop",
+        "--tokenizer_out_path",
+        "-top",
         type=str,
         required=False,
-        default="data/vocab.json",
-        help="Output path for saving the vocab JSON"
-    )
-    parser.add_argument(
-        "--merges_out_path",
-        "-mop",
-        type=str,
-        required=False,
-        default="data/merges.txt",
-        help="Output path for saving the merges.txt"
+        default="data/tokenizer.json",
+        help="Output path for saving the single tokenizer JSON (vocab+merges)."
     )
     parser.add_argument(
         "--profile",
@@ -342,15 +335,25 @@ if __name__ == "__main__":
             num_chunks=args.num_chunks
         )
 
-    vocab_serializable = {
-        v.decode("utf-8", errors="replace"): k for k, v in vocab.items()
-    }
-    with open(args.vocab_out_path, "w") as f:
-        json.dump(vocab_serializable, f, indent=2, ensure_ascii=False)
+    # Prepare special tokens to persist
+    special_tokens_out = None
+    if args.special_tokens_path:
+        try:
+            with open(args.special_tokens_path, "r", encoding="utf-8") as stf:
+                special_tokens_out = [line.strip() for line in stf if line.strip()]
+        except Exception:
+            special_tokens_out = None
 
-    merge_lines = [
-        f"{merge[0].decode('utf-8', errors='replace')} {merge[1].decode('utf-8', errors='replace')}" 
-        for merge in merges
-    ]
-    with open(args.merges_out_path, "w") as f:
-        f.write("\n".join(merge_lines))
+    # Single robust JSON: base64-encoded bytes; includes vocab, merges, special tokens
+    tokenizer_serializable = {
+        "version": 1,
+        "byte_encoding": "base64",
+        "vocab": {base64.b64encode(v).decode("ascii"): int(k) for k, v in vocab.items()},
+        "merges": [
+            [base64.b64encode(l).decode("ascii"), base64.b64encode(r).decode("ascii")]
+            for (l, r) in merges
+        ],
+        "special_tokens": special_tokens_out or [],
+    }
+    with open(args.tokenizer_out_path, "w", encoding="utf-8") as f:
+        json.dump(tokenizer_serializable, f, indent=2, ensure_ascii=False)

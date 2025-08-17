@@ -9,15 +9,15 @@ def softmax(x: Tensor, dim: int) -> Tensor:
     max_val = x.max(dim=dim, keepdim=True).values
     x_exp = (x - max_val).exp()
     x_sum = x_exp.sum(dim=dim, keepdim=True)
-    x_softmaxed = x_exp / x_sum
-    return x_softmaxed
+    x_softmax = x_exp / x_sum
+    return x_softmax
 
 
 def scaled_dot_product_attention(Q: Float[Tensor, "batch_size ... seq_len head_dim"],
                                  K: Float[Tensor, "batch_size ... seq_len head_dim"],
                                  V: Float[Tensor, "batch_size ... seq_len head_dim"],
                                  mask: Optional[Tensor] = None) -> Float[Tensor, "batch_size ... seq_len head_dim"]:
-
+    """Implement scaled dot product attention from scratch"""
     d_k = Q.shape[-1]
     scale = 1.0 / torch.sqrt(torch.tensor(d_k))
 
@@ -174,7 +174,7 @@ class RotaryPositionalEmbedding(nn.Module):
 
 
 class MultiHeadSelfAttention(nn.Module):
-
+    """Implement causal multi-head attention from scratch"""
     def __init__(self, 
                  d_model: int, 
                  num_heads: int, 
@@ -223,7 +223,7 @@ class MultiHeadSelfAttention(nn.Module):
         
 
 class TransformerBlock(nn.Module):
-
+    """Implement a transformer block from scratch"""
     def __init__(self, 
                  d_model: int, 
                  num_heads: int,
@@ -246,7 +246,7 @@ class TransformerBlock(nn.Module):
         return x
 
 class Transformer(nn.Module):
-
+    """Implement a complete Transformer LM from scratch"""
     def __init__(self,
                  vocab_size: int,
                  context_length: int,
@@ -285,6 +285,6 @@ class Transformer(nn.Module):
         for block in self.layers:
             x = block(x)
         x_norm = self.ln_final(x)
-        x_out = self.lm_head(x_norm)
+        logits = self.lm_head(x_norm)
 
-        return x_out
+        return logits
