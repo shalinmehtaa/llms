@@ -154,9 +154,10 @@ class RotaryPositionalEmbedding(nn.Module):
     def forward(self, 
                 x: Float[Tensor, "... seq_len d_k"],
                 token_positions: Int[Tensor, "... seq_len"]) -> Float[Tensor, "... seq_len d_k"]:
-        # Bounds check
-        if int(token_positions.max().item()) >= self.max_seq_len:
-            raise ValueError("token_positions exceed max_seq_len used to precompute RoPE tables.")
+        # Bounds check (tensor-only; compile-friendly)
+        max_pos_i64 = token_positions.to(torch.int64).max()
+        limit = torch.tensor(self.max_seq_len, device=token_positions.device, dtype=torch.int64)
+        torch._assert(max_pos_i64 < limit, "token_positions exceed max_seq_len used to precompute RoPE tables.")
 
         cos = self.cos_cached[token_positions.long()] # [..., seq, d_k/2]
         sin = self.sin_cached[token_positions.long()] # [..., seq, d_k/2]
@@ -171,7 +172,7 @@ class RotaryPositionalEmbedding(nn.Module):
 
         out = torch.stack((out_even, out_odd), dim=-1).flatten(-2) # [..., seq, d_k]
         return out
-
+    
 
 class MultiHeadSelfAttention(nn.Module):
     """Implement causal multi-head attention from scratch"""
