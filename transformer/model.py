@@ -47,7 +47,7 @@ class Linear(nn.Module):
         self.weights: Float[Tensor, "out_features in_features"] = \
             nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
         with torch.no_grad():
-            init_std = torch.sqrt(torch.tensor(2 / (out_features + in_features)))
+            init_std = torch.sqrt(torch.tensor(2 / (out_features + in_features), device=device))
             nn.init.trunc_normal_(self.weights, mean=0.0, std=init_std, a=-3*init_std, b=3*init_std)
 
     def forward(self, x: Float[Tensor, "... in_features"]) -> Float[Tensor, "... out_features"]:
