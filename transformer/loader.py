@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 from torch import Tensor
@@ -41,15 +42,30 @@ def get_batch(x: NDArray,
     return inputs, targets
 
 
+def load_bin_array(path: str, dtype: str = "uint16") -> NDArray:
+    """
+    Load a 1D array of token IDs from a .bin file as a memmap.
+    Assumes raw uint16 (or provided dtype) little-endian data.
+    """
+    dt = np.dtype(dtype)
+    if dt.kind not in ("i", "u"):
+        raise ValueError(f"dtype must be integer for .bin, got {dt}")
+    n_bytes = os.path.getsize(path)
+    if n_bytes % dt.itemsize != 0:
+        raise ValueError(f"File size {n_bytes} is not a multiple of dtype size {dt.itemsize}")
+    length = n_bytes // dt.itemsize
+    return np.memmap(path, mode="r", dtype=dt, shape=(length,))
+
+
 if __name__ == "__main__":
 
      # Train/valid paths (see data/inputs)
-    train_path = "data/inputs/tinystories-train-tokens.npy"
-    valid_path = "data/inputs/tinystories-valid-tokens.npy"
+    train_path = "data/inputs/tinystories-train-tokens.bin"
+    valid_path = "data/inputs/tinystories-valid-tokens.bin"
 
     # Memory-map the arrays to avoid loading into RAM
-    x_train = np.load(train_path, mmap_mode="r")  # dtype: uint16
-    x_valid = np.load(valid_path, mmap_mode="r")  # dtype: uint16
+    x_train = load_bin_array(train_path, dtype="uint16")
+    x_valid = load_bin_array(valid_path, dtype="uint16")
 
     # Quick sanity check on dtype
     assert np.issubdtype(x_train.dtype, np.integer)
@@ -59,3 +75,8 @@ if __name__ == "__main__":
     context_length = 256
     device = "cpu"  # or "cuda:0"
     inputs, targets = get_batch(x_train, batch_size, context_length, device)
+
+    print(f"{inputs.shape}")
+    print(f"{targets.shape}")
+    print("Inputs sample:", inputs[0, :10])
+    print("Targets sample:", targets[0, :10])

@@ -11,18 +11,18 @@ from transformer.optimizer import (
     learning_rate_scheduler, 
     gradient_clipping
 )
-from transformer.loader import get_batch
+from transformer.loader import get_batch, load_bin_array
 from transformer.checkpoint import save_checkpoint, load_checkpoint
+import csv
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
 
     # Data
-    p.add_argument("--train_tokens", type=str, required=True, help="Path to training tokens .npy")
-    p.add_argument("--valid_tokens", type=str, required=True, help="Path to validation tokens .npy")
-    p.add_argument("--mmap", action="store_true", default=True, help="Use memmap for datasets (default: on)")
-    p.add_argument("--dtype", type=str, default="long", help="Token dtype in npy (e.g., uint16). Only used for sanity checks.")
+    p.add_argument("--train_tokens", type=str, required=True, help="Path to training tokens .bin")
+    p.add_argument("--valid_tokens", type=str, required=True, help="Path to validation tokens .bin")
+    p.add_argument("--dtype", type=str, default="uint16", help="Token dtype for .bin (default: uint16)")
 
     # Model
     p.add_argument("--vocab_size", type=int, required=True)
@@ -45,7 +45,6 @@ def parse_args() -> argparse.Namespace:
 
     # Logging / eval / ckpt
     p.add_argument("--log_interval", type=int, default=50)
-    p.add_argument("--eval_interval", type=int, default=500)
     p.add_argument("--eval_batches", type=int, default=50, help="Num validation batches per eval")
     p.add_argument("--save_interval", type=int, default=1000)
     p.add_argument("--outdir", type=str, default="checkpoints")
@@ -85,16 +84,30 @@ def evaluate(model: Transformer,
     return float(sum(losses) / max(1, len(losses)))
 
 
+HEADER = f"{'step':>8} | {'lr':>9} | {'loss':>9} | {'ema':>9} | {'val':>9} | {'g_norm':>7} | {'tok/s':>10} | {'time':>8}"
+
+def format_row(step: int, lr: float, loss_item: float, ema: float, val_loss: float, grad_norm: float, tps: float, elapsed: float) -> str:
+	return f"{step:8d} | {lr:9.5g} | {loss_item:9.4f} | {ema:9.4f} | {val_loss:9.4f} | {float(grad_norm):7.3f} | {tps:10,.0f} | {elapsed:8.2f}s"
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
 
-    os.makedirs(args.outdir, exist_ok=True)
+    if "cuda" in args.device:
+        torch.set_float32_matmul_precision('high')
 
-    # Load datasets (memory-mapped)
-    mmap_mode = "r" if args.mmap else None
-    x_train = np.load(args.train_tokens, mmap_mode=mmap_mode)
-    x_valid = np.load(args.valid_tokens, mmap_mode=mmap_mode)
+    os.makedirs(args.outdir, exist_ok=True)
+    metrics_path = os.path.join(args.outdir, "metrics.csv")
+    write_header = not os.path.exists(metrics_path)
+    metrics_f = open(metrics_path, "a", newline="")
+    metrics_writer = csv.writer(metrics_f)
+    if write_header:
+        metrics_writer.writerow(["step","lr","train_loss","ema_loss","val_loss","grad_norm","tok_per_s","elapsed_s"])
+
+    # Load datasets (.bin memmap)
+    x_train = load_bin_array(args.train_tokens, dtype=args.dtype)
+    x_valid = load_bin_array(args.valid_tokens, dtype=args.dtype)
 
     assert np.issubdtype(x_train.dtype, np.integer), f"train dtype must be integer, got {x_train.dtype}"
     assert np.issubdtype(x_valid.dtype, np.integer), f"valid dtype must be integer, got {x_valid.dtype}"
@@ -140,6 +153,7 @@ def main():
     tokens_per_step = args.batch_size * args.context_length
     t0 = time.time()
     running_loss: Optional[float] = None
+    printed_header = False
 
     for step in range(start_step, args.max_steps):
         # LR schedule (cosine with warmup)
@@ -174,16 +188,17 @@ def main():
 
         if (step + 1) % args.log_interval == 0 or step == start_step:
             elapsed = time.time() - t0
-            toks = tokens_per_step * args.log_interval if (step + 1) % args.log_interval == 0 else tokens_per_step
+            toks = tokens_per_step * (args.log_interval if (step + 1) % args.log_interval == 0 else 1)
             tps = toks / max(1e-6, elapsed)
-            print(f"step {step+1:7d} | lr {lr:.5g} | train_loss {loss_item:.4f} | ema_loss {running_loss:.4f} | "
-                  f"grad_norm {float(grad_norm):.3f} | tok/s {tps:,.0f}")
-            t0 = time.time()
-
-        # Periodic eval
-        if (step + 1) % args.eval_interval == 0:
+            # eval synced with logging
             val_loss = evaluate(model, x_valid, args.batch_size, args.context_length, device=str(device), num_batches=args.eval_batches)
-            print(f"[eval] step {step+1:7d} | val_loss {val_loss:.4f}")
+            if not printed_header or ((step + 1) % (args.log_interval * 20) == 0):
+                print(HEADER)
+                printed_header = True
+            print(format_row(step + 1, lr, loss_item, running_loss, val_loss, grad_norm, tps, elapsed))
+            metrics_writer.writerow([step + 1, lr, loss_item, running_loss, val_loss, float(grad_norm), tps, elapsed])
+            metrics_f.flush()
+            t0 = time.time()
 
         # Periodic save
         if (step + 1) % args.save_interval == 0:
@@ -195,6 +210,7 @@ def main():
     final_ckpt = os.path.join(args.outdir, f"final_step_{args.max_steps}.pt")
     save_checkpoint(model, optimizer, iteration=args.max_steps, out=final_ckpt)
     print(f"[ckpt] final saved to {final_ckpt}")
+    metrics_f.close()
 
 
 if __name__ == "__main__":
