@@ -16,7 +16,6 @@ def cross_entropy(logits: Float[Tensor, "... vocab_size"],
     target_logits = logits_shifted.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
     # Compute loss
     nll = log_sum_exp - target_logits
-    
     return nll.mean()
 
 
@@ -101,5 +100,5 @@ class AdamW(torch.optim.Optimizer):
                 state["m"] = m_t
                 state["v"] = v_t
                 
-                return loss
+        return loss
     

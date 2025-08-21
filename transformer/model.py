@@ -19,7 +19,7 @@ def scaled_dot_product_attention(Q: Float[Tensor, "batch_size ... seq_len head_d
                                  mask: Optional[Tensor] = None) -> Float[Tensor, "batch_size ... seq_len head_dim"]:
     """Implement scaled dot product attention from scratch"""
     d_k = Q.shape[-1]
-    scale = 1.0 / torch.sqrt(torch.tensor(d_k))
+    scale = 1.0 / (d_k ** 0.5)
 
     # Affinities: [..., seq_len, seq_len]
     attn_logits = Q @ K.transpose(-2, -1)
@@ -47,7 +47,7 @@ class Linear(nn.Module):
         self.weights: Float[Tensor, "out_features in_features"] = \
             nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
         with torch.no_grad():
-            init_std = torch.sqrt(torch.tensor(2 / (out_features + in_features), device=device))
+            init_std = (2 / (out_features + in_features)) ** 0.5
             nn.init.trunc_normal_(self.weights, mean=0.0, std=init_std, a=-3*init_std, b=3*init_std)
 
     def forward(self, x: Float[Tensor, "... in_features"]) -> Float[Tensor, "... out_features"]:
@@ -65,7 +65,8 @@ class Embedding(nn.Module):
         self.weights: Float[Tensor, "vocab_size d_model"] = \
             nn.Parameter(torch.empty(vocab_size, d_model, device=device, dtype=dtype))
         with torch.no_grad():
-            nn.init.trunc_normal_(self.weights, a=-3, b=3)
+            init_std = 1.0 / (d_model ** 0.5)
+            nn.init.trunc_normal_(self.weights, mean=0.0, std=init_std, a=-3*init_std, b=3*init_std)
 
     def forward(self, token_ids: Int[Tensor, "batch seq_len"]) -> Float[Tensor, "batch seq_len d_model"]:
         return self.weights[token_ids.long()]
@@ -280,6 +281,8 @@ class Transformer(nn.Module):
         ])
         self.ln_final = RMSNorm(self.d_model)
         self.lm_head = Linear(self.d_model, self.vocab_size, device=device, dtype=dtype)
+        # Weight tying
+        self.lm_head.weights = self.token_embeddings.weights  
 
     def forward(self, in_tokens: Float[Tensor, "batch_size seq_len"]) -> Float[Tensor, "batch_size seq_len vocab_size"]:
         x = self.token_embeddings(in_tokens)

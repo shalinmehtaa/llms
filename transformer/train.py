@@ -1,4 +1,5 @@
 import os
+import csv
 import time
 import torch
 import argparse
@@ -13,7 +14,6 @@ from transformer.optimizer import (
 )
 from transformer.loader import get_batch, load_bin_array
 from transformer.checkpoint import save_checkpoint, load_checkpoint
-import csv
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,10 +130,7 @@ def main():
 
     # Optional compile
     if args.compile:
-        if hasattr(torch, "compile"):
-            model = torch.compile(model, mode=args.compile_mode)
-        else:
-            print("Requested --compile, but torch.compile is not available in this PyTorch version.", flush=True)
+        model = torch.compile(model, mode=args.compile_mode)
 
     # Optimizer (custom AdamW; stateful and checkpointable)
     optimizer = AdamW(
@@ -169,8 +166,9 @@ def main():
 
         # Sample batch
         xb, yb = get_batch(x_train, args.batch_size, args.context_length, device)
-        logits = model(xb)
-        loss = cross_entropy(logits, yb)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32):
+            logits = model(xb)
+            loss = cross_entropy(logits, yb)
 
         # Backward
         optimizer.zero_grad(set_to_none=True)

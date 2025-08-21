@@ -12,8 +12,9 @@ from typing import (
     Iterator
 )
 import numpy as np
-from numpy.lib.format import open_memmap
 from tqdm.auto import tqdm
+from itertools import repeat
+from concurrent.futures import ProcessPoolExecutor
 
 from ..pretokenization import pretokenize_chunk
 
@@ -224,88 +225,67 @@ def _tokenize_to_bin(tokenizer: "Tokenizer",
 
     return total
 
-
-def _count_tokens(tokenizer: "Tokenizer",
-                  dataset_path: str,
-                  append_eot: Optional[str],
-                  show_progress: bool = True) -> tuple[int, Optional[int]]:
-    total = 0
-    eot_id: Optional[int] = None
-    if append_eot:
-        eot_id = _resolve_special_id(tokenizer, append_eot)
-
-    itr = _iter_texts(dataset_path)
-    if show_progress:
-        itr = tqdm(itr, desc="Counting (npy pass 1/2)", unit="lines")
-
-    for text in itr:
-        c = 0
-        for _ in tokenizer.encode_iterable([text]):
-            c += 1
-        total += c
-        if eot_id is not None:
-            total += 1
-
-    return total, eot_id
-
-
-def _tokenize_to_npy(tokenizer: "Tokenizer",
-                     dataset_path: str,
-                     out_path: str,
-                     append_eot: Optional[str],
-                     buffer_size: int = 1_000_000,
-                     show_progress: bool = True) -> int:
-    """Write token ids to a .npy file (uint16) via two passes using a memmap."""
-    total, eot_id = _count_tokens(tokenizer, dataset_path, append_eot, show_progress)
-
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    mm = open_memmap(out_path, mode="w+", dtype=np.uint16, shape=(total,))
-    pos = 0
-    buf: List[int] = []
-
-    itr = _iter_texts(dataset_path)
-    if show_progress:
-        itr = tqdm(itr, desc="Writing (npy pass 2/2)", unit="lines")
-
-    for text in itr:
-        for tok in tokenizer.encode_iterable([text]):
-            buf.append(tok)
-            if len(buf) >= buffer_size:
-                n = len(buf)
-                mm[pos:pos + n] = np.asarray(buf, dtype=np.uint16)
-                pos += n
-                buf.clear()
-        if eot_id is not None:
-            buf.append(eot_id)
-            if len(buf) >= buffer_size:
-                n = len(buf)
-                mm[pos:pos + n] = np.asarray(buf, dtype=np.uint16)
-                pos += n
-                buf.clear()
-
-    if buf:
-        n = len(buf)
-        mm[pos:pos + n] = np.asarray(buf, dtype=np.uint16)
-        pos += n
-        buf.clear()
-
-    mm.flush()
-    return total
-
-
-def _default_out_path(dataset_path: str, out_format: str) -> str:
-    base = Path(dataset_path)
-    if base.is_dir():
-        name = base.name
-    else:
-        name = base.stem
-    ext = ".npy" if out_format == "npy" else ".bin"
-    return str(Path("data") / f"{name}-tokens{ext}")
-
-
 def _write_meta(meta_path: str, meta: dict):
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
+
+
+# Global tokenizer reference for worker processes
+_G_TOKENIZER = None
+
+def _worker_init_tokenizer(tokenizer_path: str, special_tokens: Optional[List[str]]):
+    global _G_TOKENIZER
+    tok = Tokenizer.from_file(tokenizer_path)
+    if special_tokens is not None:
+        tok.special_tokens = special_tokens
+        tok._special_token_bytes_to_id = {}
+        for s in tok.special_tokens:
+            b = s.encode("utf-8")
+            tok_id = tok._token_to_id.get(b)
+            if tok_id is not None:
+                tok._special_token_bytes_to_id[b] = tok_id
+    _G_TOKENIZER = tok
+
+def _encode_lines_worker(lines: List[str], eot_id: Optional[int]) -> np.ndarray:
+    out: List[int] = []
+    for text in lines:
+        for tok in _G_TOKENIZER.encode_iterable([text]):
+            out.append(tok)
+        if eot_id is not None:
+            out.append(eot_id)
+    return np.asarray(out, dtype=np.uint16)
+
+def _batched_iter_lines(dataset_path: str, batch_size: int) -> Iterator[List[str]]:
+    batch: List[str] = []
+    for line in _iter_texts(dataset_path):
+        batch.append(line)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+def _tokenize_to_bin_parallel(tokenizer_path: str,
+                              special_tokens: Optional[List[str]],
+                              dataset_path: str,
+                              out_path: str,
+                              eot_id: Optional[int],
+                              workers: int,
+                              batch_lines: int,
+                              show_progress: bool = True) -> int:
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    with ProcessPoolExecutor(max_workers=workers,
+                             initializer=_worker_init_tokenizer,
+                             initargs=(tokenizer_path, special_tokens)) as ex:
+        batches = _batched_iter_lines(dataset_path, batch_lines)
+        results = ex.map(_encode_lines_worker, batches, repeat(eot_id))
+        itr = results if not show_progress else tqdm(results, desc="Tokenizing (bin, parallel)", unit="batches")
+        with open(out_path, "wb") as f:
+            for arr in itr:
+                arr.tofile(f)
+                total += int(arr.size)
+    return total
 
 
 if __name__ == "__main__":
@@ -324,11 +304,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--out_path", "-o", type=str, required=False,
-        help="Output file path. Defaults to data/<dataset_name>-tokens.(bin|npy) based on --format."
+        help="Output .bin path. Defaults to data/<dataset_name>-tokens.bin"
     )
     parser.add_argument(
-        "--format", "-f", type=str, choices=["bin", "npy"], default="bin",
-        help="Serialization format: 'bin' (streaming raw uint16) or 'npy' (memmapped two-pass)."
+        "--workers", "-w", type=int, default=1,
+        help="Number of parallel workers"
+    )
+    parser.add_argument(
+        "--batch_lines", "-b", type=int, default=1024,
+        help="Number of lines per parallel batch"
     )
     parser.add_argument(
         "--append_eot", action="store_true",
@@ -360,22 +344,29 @@ if __name__ == "__main__":
 
     _ensure_uint16_capacity(tokenizer)
 
-    out_path = args.out_path or _default_out_path(args.dataset_path, args.format)
+    # Default output path
+    base = Path(args.dataset_path)
+    name = base.name if base.is_dir() else base.stem
+    out_path = args.out_path or str(Path("data") / f"{name}-tokens.bin")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
     show_progress = not args.no_tqdm
+    eot_id = _resolve_special_id(tokenizer, args.eot_token) if args.append_eot else None
 
-    # Invoke the actual tokenization on the inner functions
-    if args.format == "bin":
-        total = _tokenize_to_bin(
-            tokenizer=tokenizer,
+    # Parallel or sequential
+    if args.workers > 1:
+        total = _tokenize_to_bin_parallel(
+            tokenizer_path=args.tokenizer_path,
+            special_tokens=special_tokens,
             dataset_path=args.dataset_path,
             out_path=out_path,
-            append_eot=(args.eot_token if args.append_eot else None),
+            eot_id=eot_id,
+            workers=args.workers,
+            batch_lines=args.batch_lines,
             show_progress=show_progress,
         )
     else:
-        total = _tokenize_to_npy(
+        total = _tokenize_to_bin(
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
             out_path=out_path,
@@ -386,12 +377,13 @@ if __name__ == "__main__":
     meta = {
         "total_tokens": int(total),
         "dtype": "uint16",
-        "format": args.format,
         "dataset_path": args.dataset_path,
         "tokenizer_path": args.tokenizer_path,
         "special_tokens_path": args.special_tokens_path,
         "append_eot": bool(args.append_eot),
         "eot_token": args.eot_token if args.append_eot else None,
+        "workers": args.workers,
+        "batch_lines": args.batch_lines,
     }
     _write_meta(out_path + ".meta.json", meta)
     print(f"Wrote {total} tokens to {out_path} (uint16). Meta: {out_path}.meta.json")
