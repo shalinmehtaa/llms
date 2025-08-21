@@ -3,8 +3,10 @@ import csv
 import time
 import torch
 import argparse
+import functools
 import numpy as np
 from typing import Optional
+import torch.nn as nn
 import torch.distributed as dist
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -98,17 +100,31 @@ def evaluate(model: Transformer,
              context_length: int,
              device: str,
              num_batches: int) -> float:
-    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        return 0.0
+    # All ranks must participate in forward under FSDP
+    was_training = model.training
     model.eval()
-    losses = []
+
+    device_type = "cuda" if "cuda" in device else "cpu"
+    total = torch.tensor(0.0, device=device_type)
+    count = torch.tensor(0, device=device_type)
+
     for _ in range(num_batches):
         xb, yb = get_batch(x_valid, batch_size, context_length, device)
-        logits = model(xb)
-        loss = cross_entropy(logits, yb).item()
-        losses.append(loss)
-    model.train()
-    return float(sum(losses) / max(1, len(losses)))
+        # Match training numerics: forward under autocast; loss in fp32
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16 if device_type == "cuda" else torch.float32):
+            logits = model(xb)
+        loss = cross_entropy(logits, yb)
+        total += loss.detach()
+        count += 1
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(total, op=dist.ReduceOp.SUM)
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+
+    if was_training:
+        model.train()
+    avg = (total / count.clamp(min=1)).item()
+    return float(avg)
 
 
 HEADER = f"{'step':>8} | {'lr':>9} | {'loss':>9} | {'ema':>9} | {'val':>9} | {'g_norm':>7} | {'tok/s':>10} | {'time':>8}"
@@ -160,14 +176,17 @@ def main():
         theta=args.theta,
         device=device,
         dtype=None,
-    )
+    )   
 
     if args.compile:
         # torch.compile + FSDP is fragile; skip compile when using fsdp
         assert not args.fsdp, "Disable --compile when using --fsdp"
 
     if args.fsdp:
-        auto_wrap = transformer_auto_wrap_policy({TransformerBlock})
+        auto_wrap = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={TransformerBlock},
+        )
         mp = MixedPrecision(param_dtype=None, # Set by autocast
                             reduce_dtype=torch.bfloat16,
                             buffer_dtype=torch.bfloat16)
@@ -222,8 +241,9 @@ def main():
             xb, yb = get_batch(x_train, args.batch_size, args.context_length, device=str(device))
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32):
                 logits = model(xb)
-                loss = cross_entropy(logits, yb) / args.grad_accum_steps
-                total_loss += loss.item()
+            # Compute loss outside of autocast for numerical stability
+            loss = cross_entropy(logits, yb) / args.grad_accum_steps
+            total_loss += loss.item()
             loss.backward()
 
         # Gradient clipping
@@ -232,29 +252,34 @@ def main():
         optimizer.step()
 
         # Logging (rank 0)
-        if main_process:
-            loss_item = total_loss
-            running_loss = loss_item if running_loss is None else (0.95 * running_loss + 0.05 * loss_item)
-            if (step + 1) % args.log_interval == 0 or step == start_step:
-                elapsed = time.time() - t0
-                toks = tokens_per_micro_step * args.grad_accum_steps * (args.log_interval if (step + 1) % args.log_interval == 0 else 1) * world_size
-                tps = toks / max(1e-6, elapsed)
-                val_loss = evaluate(model, x_valid, args.batch_size, args.context_length, device=str(device), num_batches=args.eval_batches)
+        do_log = ((step + 1) % args.log_interval == 0) or (step == start_step)
+        if do_log:
+            elapsed = time.time() - t0
+            toks = tokens_per_micro_step * args.grad_accum_steps * args.log_interval * world_size
+            tps = toks / max(1e-6, elapsed)
+
+            # Everyone runs eval (needed for FSDP), only rank 0 prints/writes
+            val_loss = evaluate(model, x_valid, args.batch_size, args.context_length, device=str(device), num_batches=args.eval_batches)
+
+            if main_process:
+                loss_item = total_loss
+                running_loss = loss_item if running_loss is None else (0.95 * running_loss + 0.05 * loss_item)
                 if not printed_header or ((step + 1) % (args.log_interval * 20) == 0):
                     print(HEADER)
                     printed_header = True
                 print(format_row(step + 1, lr, loss_item, running_loss, val_loss, grad_norm, tps, elapsed))
                 metrics_writer.writerow([step + 1, lr, loss_item, running_loss, val_loss, float(grad_norm), tps, elapsed])
                 metrics_f.flush()
-                t0 = time.time()
+            t0 = time.time()
 
-        # Periodic save (rank 0)
-        if main_process and not args.sharded_checkpoint:
-            ckpt_path = os.path.join(args.outdir, f"step_{step+1}.pt")
-            save_checkpoint(model, optimizer, iteration=step+1, out=ckpt_path, weights_only=args.weights_only)
-        elif args.sharded_checkpoint:
-            # every rank saves its shard
-            save_checkpoint_sharded(model, optimizer, iteration=step+1, out_dir=args.outdir, save_optimizer=not args.weights_only)
+        if (step + 1) % args.save_interval == 0:
+            # Periodic save (rank 0)
+            if main_process and not args.sharded_checkpoint:
+                ckpt_path = os.path.join(args.outdir, f"step_{step+1}.pt")
+                save_checkpoint(model, optimizer, iteration=step+1, out=ckpt_path, weights_only=args.weights_only)
+            elif args.sharded_checkpoint:
+                # every rank saves its shard
+                save_checkpoint_sharded(model, optimizer, iteration=step+1, out_dir=args.outdir, save_optimizer=not args.weights_only)
 
     # Final save
     final_ckpt = os.path.join(args.outdir, f"final_step_{args.max_steps}.pt")
