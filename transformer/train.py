@@ -5,7 +5,13 @@ import torch
 import argparse
 import numpy as np
 from typing import Optional
-from transformer.model import Transformer
+import torch.distributed as dist
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    ShardingStrategy,
+    MixedPrecision
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformer.optimizer import (
     AdamW, 
     cross_entropy, 
@@ -13,7 +19,13 @@ from transformer.optimizer import (
     gradient_clipping
 )
 from transformer.loader import get_batch, load_bin_array
-from transformer.checkpoint import save_checkpoint, load_checkpoint
+from transformer.model import Transformer, TransformerBlock
+from transformer.checkpoint import (
+    save_checkpoint, 
+    load_checkpoint,
+    save_checkpoint_sharded,
+    load_checkpoint_sharded
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +69,10 @@ def parse_args() -> argparse.Namespace:
     # Performance
     p.add_argument("--compile", action="store_true", help="Enable torch.compile for the model")
     p.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"])
+    p.add_argument("--fsdp", action="store_true", help="Enable FSDP")
+    p.add_argument("--grad_accum_steps", type=int, default=1)
+    p.add_argument("--weights_only", action="store_true", help="Save model weights only (no optimizer).")
+    p.add_argument("--sharded_checkpoint", action="store_true", help="Save/load sharded checkpoints per-rank.")
 
     return p.parse_args()
 
@@ -64,6 +80,15 @@ def parse_args() -> argparse.Namespace:
 def set_seed(seed: int):
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+def is_dist() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+def get_rank() -> int:
+    return dist.get_rank() if is_dist() else 0
+
+def is_main_process() -> bool:
+    return get_rank() == 0
 
 
 @torch.no_grad()
@@ -73,6 +98,8 @@ def evaluate(model: Transformer,
              context_length: int,
              device: str,
              num_batches: int) -> float:
+    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        return 0.0
     model.eval()
     losses = []
     for _ in range(num_batches):
@@ -92,7 +119,15 @@ def format_row(step: int, lr: float, loss_item: float, ema: float, val_loss: flo
 
 def main():
     args = parse_args()
-    set_seed(args.seed)
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+        args.device = f"cuda:{os.environ.get('LOCAL_RANK','0')}"
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    main_process = (rank == 0)
+
+    set_seed(args.seed + rank)
 
     if "cuda" in args.device:
         torch.set_float32_matmul_precision('high')
@@ -126,11 +161,25 @@ def main():
         device=device,
         dtype=None,
     )
-    model.to(device)
 
-    # Optional compile
     if args.compile:
-        model = torch.compile(model, mode=args.compile_mode)
+        # torch.compile + FSDP is fragile; skip compile when using fsdp
+        assert not args.fsdp, "Disable --compile when using --fsdp"
+
+    if args.fsdp:
+        auto_wrap = transformer_auto_wrap_policy({TransformerBlock})
+        mp = MixedPrecision(param_dtype=None, # Set by autocast
+                            reduce_dtype=torch.bfloat16,
+                            buffer_dtype=torch.bfloat16)
+        model = FSDP(
+            model,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            auto_wrap_policy=auto_wrap,
+            mixed_precision=mp,
+            device_id=device,
+        )
+    else:
+        model.to(device)
 
     # Optimizer (custom AdamW; stateful and checkpointable)
     optimizer = AdamW(
@@ -141,19 +190,22 @@ def main():
 
     start_step = 0
     if args.resume is not None and os.path.exists(args.resume):
-        # Restore states to the requested device (also moves optimizer states)
-        start_step = load_checkpoint(args.resume, model, optimizer, device=device)
-        print(f"Resumed from {args.resume} at step={start_step}")
+        if args.sharded_checkpoint and os.path.isdir(args.resume):
+            start_step = load_checkpoint_sharded(args.resume, model, optimizer, device=device)
+        else:
+            start_step = load_checkpoint(args.resume, model, optimizer, device=device)
+        if is_main_process():
+            print(f"Resumed from {args.resume} at step={start_step}")
 
     # Training loop
     model.train()
-    tokens_per_step = args.batch_size * args.context_length
+    tokens_per_micro_step = args.batch_size * args.context_length
     t0 = time.time()
     running_loss: Optional[float] = None
     printed_header = False
 
     for step in range(start_step, args.max_steps):
-        # LR schedule (cosine with warmup)
+        # LR schedule per optimizer step
         lr = learning_rate_scheduler(
             t=step,
             lr_max=args.lr,
@@ -164,51 +216,55 @@ def main():
         for g in optimizer.param_groups:
             g["lr"] = lr
 
-        # Sample batch
-        xb, yb = get_batch(x_train, args.batch_size, args.context_length, device)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32):
-            logits = model(xb)
-            loss = cross_entropy(logits, yb)
-
-        # Backward
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        total_loss = 0.0
+        for _ in range(args.grad_accum_steps):
+            xb, yb = get_batch(x_train, args.batch_size, args.context_length, device=str(device))
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32):
+                logits = model(xb)
+                loss = cross_entropy(logits, yb) / args.grad_accum_steps
+                total_loss += loss.item()
+            loss.backward()
 
         # Gradient clipping
         grad_norm = gradient_clipping(list(model.parameters()), args.clip_grad)
 
-        # Step
         optimizer.step()
 
-        # Logging
-        loss_item = float(loss.item())
-        running_loss = loss_item if running_loss is None else (0.95 * running_loss + 0.05 * loss_item)
+        # Logging (rank 0)
+        if main_process:
+            loss_item = total_loss
+            running_loss = loss_item if running_loss is None else (0.95 * running_loss + 0.05 * loss_item)
+            if (step + 1) % args.log_interval == 0 or step == start_step:
+                elapsed = time.time() - t0
+                toks = tokens_per_micro_step * args.grad_accum_steps * (args.log_interval if (step + 1) % args.log_interval == 0 else 1) * world_size
+                tps = toks / max(1e-6, elapsed)
+                val_loss = evaluate(model, x_valid, args.batch_size, args.context_length, device=str(device), num_batches=args.eval_batches)
+                if not printed_header or ((step + 1) % (args.log_interval * 20) == 0):
+                    print(HEADER)
+                    printed_header = True
+                print(format_row(step + 1, lr, loss_item, running_loss, val_loss, grad_norm, tps, elapsed))
+                metrics_writer.writerow([step + 1, lr, loss_item, running_loss, val_loss, float(grad_norm), tps, elapsed])
+                metrics_f.flush()
+                t0 = time.time()
 
-        if (step + 1) % args.log_interval == 0 or step == start_step:
-            elapsed = time.time() - t0
-            toks = tokens_per_step * (args.log_interval if (step + 1) % args.log_interval == 0 else 1)
-            tps = toks / max(1e-6, elapsed)
-            # eval synced with logging
-            val_loss = evaluate(model, x_valid, args.batch_size, args.context_length, device=str(device), num_batches=args.eval_batches)
-            if not printed_header or ((step + 1) % (args.log_interval * 20) == 0):
-                print(HEADER)
-                printed_header = True
-            print(format_row(step + 1, lr, loss_item, running_loss, val_loss, grad_norm, tps, elapsed))
-            metrics_writer.writerow([step + 1, lr, loss_item, running_loss, val_loss, float(grad_norm), tps, elapsed])
-            metrics_f.flush()
-            t0 = time.time()
-
-        # Periodic save
-        if (step + 1) % args.save_interval == 0:
+        # Periodic save (rank 0)
+        if main_process and not args.sharded_checkpoint:
             ckpt_path = os.path.join(args.outdir, f"step_{step+1}.pt")
-            save_checkpoint(model, optimizer, iteration=step+1, out=ckpt_path)
-            print(f"[ckpt] saved to {ckpt_path}")
+            save_checkpoint(model, optimizer, iteration=step+1, out=ckpt_path, weights_only=args.weights_only)
+        elif args.sharded_checkpoint:
+            # every rank saves its shard
+            save_checkpoint_sharded(model, optimizer, iteration=step+1, out_dir=args.outdir, save_optimizer=not args.weights_only)
 
     # Final save
     final_ckpt = os.path.join(args.outdir, f"final_step_{args.max_steps}.pt")
     save_checkpoint(model, optimizer, iteration=args.max_steps, out=final_ckpt)
     print(f"[ckpt] final saved to {final_ckpt}")
     metrics_f.close()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
