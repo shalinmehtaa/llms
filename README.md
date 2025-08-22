@@ -30,7 +30,7 @@ python -m tokenization.bpe.train \
 python -m tokenization.bpe.tokenizer \
   --dataset_path data/TinyStoriesV2-GPT4-train.txt \
   --tokenizer_path data/tokenizers/tinystories-tokenizer-50304.json \
-  --out_path data/inputs/tinystories-train-tokens.npy \
+  --out_path data/inputs/tinystories-train-tokens.bin \
   --append_eot
 ```
 
@@ -39,8 +39,8 @@ python -m tokenization.bpe.tokenizer \
 Single GPU:
 ```bash
 python -m transformer.train \
-  --train_tokens data/inputs/tinystories-train-tokens.npy \
-  --valid_tokens data/inputs/tinystories-valid-tokens.npy \
+  --train_tokens data/inputs/tinystories-train-tokens.bin \
+  --valid_tokens data/inputs/tinystories-valid-tokens.bin \
   --vocab_size 50304 \
   --context_length 512 \
   --num_layers 8 \
@@ -55,8 +55,8 @@ python -m transformer.train \
 Multi-GPU with FSDP:
 ```bash
 torchrun --nproc_per_node=4 -m transformer.train \
-  --train_tokens data/inputs/tinystories-train-tokens.npy \
-  --valid_tokens data/inputs/tinystories-valid-tokens.npy \
+  --train_tokens data/inputs/tinystories-train-tokens.bin \
+  --valid_tokens data/inputs/tinystories-valid-tokens.bin \
   --vocab_size 50304 \
   --context_length 1024 \
   --num_layers 24 \
