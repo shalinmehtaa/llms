@@ -61,7 +61,7 @@ Multi-GPU with FSDP:
 ```bash
 source .venv/bin/activate
 
-uv run torchrun --nproc_per_node=4 -m transformer.train \
+torchrun --nproc_per_node=4 -m transformer.train \
   --train_tokens data/inputs/tinystories-train-tokens.bin \
   --valid_tokens data/inputs/tinystories-valid-tokens.bin \
   --vocab_size 50304 \
