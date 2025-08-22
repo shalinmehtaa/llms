@@ -177,5 +177,5 @@ cython_debug/
 # Text files
 *.txt
 *.npy*
-*.prof
 *.pt
+data/*
