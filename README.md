@@ -17,7 +17,7 @@ uv sync
 ### Train BPE Tokenizer
 
 ```bash
-python -m tokenization.bpe.train \
+uv run -m tokenization.bpe.train \
   --file_path data/TinyStoriesV2-GPT4-train.txt \
   --vocab_size 50304 \
   --special_tokens_path data/special_tokens.txt \
@@ -27,7 +27,7 @@ python -m tokenization.bpe.train \
 ### Tokenize Dataset
 
 ```bash
-python -m tokenization.bpe.tokenizer \
+uv run -m tokenization.bpe.tokenizer \
   --dataset_path data/TinyStoriesV2-GPT4-train.txt \
   --tokenizer_path data/tokenizers/tinystories-tokenizer-50304.json \
   --out_path data/inputs/tinystories-train-tokens.bin \
@@ -38,7 +38,7 @@ python -m tokenization.bpe.tokenizer \
 
 Single GPU:
 ```bash
-python -m transformer.train \
+uv run -m transformer.train \
   --train_tokens data/inputs/tinystories-train-tokens.bin \
   --valid_tokens data/inputs/tinystories-valid-tokens.bin \
   --vocab_size 50304 \
@@ -48,13 +48,20 @@ python -m transformer.train \
   --num_heads 16 \
   --d_ff 2048 \
   --batch_size 64 \
-  --lr 2e-4 \
-  --max_steps 50000
+  --lr 3e-4 \
+  --weight_decay 0.01 \
+  --clip_grad 1.0 \ 
+  --max_steps 20000 --warmup_steps 200 \
+  --log_interval 10 --save_interval 1000 \
+  --compile \
+  --outdir checkpoints \
 ```
 
 Multi-GPU with FSDP:
 ```bash
-torchrun --nproc_per_node=4 -m transformer.train \
+source .venv/bin/activate
+
+uv run torchrun --nproc_per_node=4 -m transformer.train \
   --train_tokens data/inputs/tinystories-train-tokens.bin \
   --valid_tokens data/inputs/tinystories-valid-tokens.bin \
   --vocab_size 50304 \
@@ -66,7 +73,10 @@ torchrun --nproc_per_node=4 -m transformer.train \
   --batch_size 8 \
   --grad_accum_steps 4 \
   --lr 3e-4 \
-  --max_steps 100000 \
+  --min_lr 3e-5
+  --max_steps 10000 --warmup_steps 100 \
   --fsdp \
-  --compile
+  --log_interval 10 --save_interval 2000 \
+  --outdir checkpoints \
+  --weights_only
 ```
