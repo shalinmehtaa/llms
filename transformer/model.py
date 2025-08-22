@@ -6,13 +6,16 @@ from typing import Optional, Union
 from jaxtyping import Float, Int, Bool
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-def softmax(x: Tensor, dim: int) -> Tensor:
+def softmax(x: torch.Tensor, dim: int, temperature: Optional[float] = None) -> torch.Tensor:
     """Implement numerically stable softmax from scratch"""
     max_val = x.max(dim=dim, keepdim=True).values
-    x_exp = (x - max_val).exp()
-    x_sum = x_exp.sum(dim=dim, keepdim=True)
-    x_softmax = x_exp / x_sum
-    return x_softmax
+    if temperature is None:
+        z = x - max_val
+    else:
+        t = torch.as_tensor(temperature, dtype=x.dtype, device=x.device)
+        z = (x - max_val) / (t + 1e-5)
+    x_exp = z.exp()
+    return x_exp / x_exp.sum(dim=dim, keepdim=True)
 
 
 def scaled_dot_product_attention(Q: Float[Tensor, "batch_size ... seq_len head_dim"],

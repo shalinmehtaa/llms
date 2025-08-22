@@ -21,7 +21,7 @@ uv run -m tokenization.bpe.train \
   --file_path data/TinyStoriesV2-GPT4-train.txt \
   --vocab_size 50304 \
   --special_tokens_path data/special_tokens.txt \
-  --tokenizer_out_path data/tokenizers/tinystories-tokenizer-50304.json
+  --tokenizer_out_path tokenization/tokenizers/tinystories-tokenizer-50304.json
 ```
 
 ### Tokenize Dataset
@@ -29,7 +29,7 @@ uv run -m tokenization.bpe.train \
 ```bash
 uv run -m tokenization.bpe.tokenizer \
   --dataset_path data/TinyStoriesV2-GPT4-train.txt \
-  --tokenizer_path data/tokenizers/tinystories-tokenizer-50304.json \
+  --tokenizer_path tokenization/tokenizers/tinystories-tokenizer-50304.json \
   --out_path data/inputs/tinystories-train-tokens.bin \
   --append_eot
 ```

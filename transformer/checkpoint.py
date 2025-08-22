@@ -49,14 +49,21 @@ def load_checkpoint(src: PathOrFile, model: Module, optimizer: Optimizer, device
     """Load consolidated checkpoint (single file)."""
     device = torch.device(device)
     ckpt = torch.load(src, map_location=device, weights_only=False)
+
+    # Normalize state_dict keys saved from torch.compile (prefixed with _orig_mod.)
+    model_sd = ckpt.get("model", {})
+    if any(k.startswith("_orig_mod.") for k in model_sd.keys()):
+        model_sd = {k.replace("_orig_mod.", "", 1): v for k, v in model_sd.items()}
+
     if _is_fsdp_model(model):
         with FSDP.state_dict_type(
             model, StateDictType.FULL_STATE_DICT,
             state_dict_config=FullStateDictConfig(offload_to_cpu=False, rank0_only=False),
         ):
-            model.load_state_dict(ckpt["model"])
+            model.load_state_dict(model_sd)
     else:
-        model.load_state_dict(ckpt["model"])
+        model.load_state_dict(model_sd)
+
     if "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
         for state in optimizer.state.values():
