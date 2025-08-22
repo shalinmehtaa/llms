@@ -142,3 +142,4 @@ def load_checkpoint_sharded(src_dir: str, model: Module, optimizer: Optimizer, d
         with open(meta_path, "r") as f:
             meta = json.load(f)
     return int(meta.get("iteration", 0))
+	

@@ -178,4 +178,4 @@ cython_debug/
 *.txt
 *.npy*
 *.prof
-checkpoints/*
+*.pt

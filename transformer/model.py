@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
-from jaxtyping import Float, Int, Bool
 from typing import Optional, Union
+from jaxtyping import Float, Int, Bool
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 def softmax(x: Tensor, dim: int) -> Tensor:
     """Implement numerically stable softmax from scratch"""
@@ -180,6 +182,7 @@ class MultiHeadSelfAttention(nn.Module):
     def __init__(self, 
                  d_model: int, 
                  num_heads: int, 
+                 use_sdpa: bool = False,
                  rope: Optional["RotaryPositionalEmbedding"] = None,
                  device: Optional[Union[str, torch.device]] = None, 
                  dtype: Optional[torch.dtype] = None):
@@ -198,11 +201,12 @@ class MultiHeadSelfAttention(nn.Module):
         if self.rope is not None:
             assert self.rope.head_dim == self.head_dim, "RoPE d_k must equal head_dim"
 
+        self.use_sdpa = use_sdpa
+
     def forward(self, 
                 x: Float[Tensor, "batch seq_len d_model"], 
                 token_positions: Optional[Int[Tensor, "batch seq_len"]] = None) -> Float[Tensor, "batch seq_len d_model"]:
         b, s, _ = x.shape
-        mask = torch.ones(s, s, dtype=torch.bool, device=x.device).tril()
 
         q = self.q_proj(x).reshape(b, s, self.num_heads, self.head_dim).transpose(1, 2) # [b, h, s, d]
         k = self.k_proj(x).reshape(b, s, self.num_heads, self.head_dim).transpose(1, 2) # [b, h, s, d]
@@ -219,7 +223,16 @@ class MultiHeadSelfAttention(nn.Module):
             q = self.rope(q, pos_b1s)
             k = self.rope(k, pos_b1s)
 
-        attn_out = scaled_dot_product_attention(q, k, v, mask) # [b, h, s, d]
+        if self.use_sdpa:
+            # Prefer native SDPA kernels on CUDA when using FSDP
+            with sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]):
+                attn_out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
+                ) # [b, h, s, d]
+        else:
+            mask = torch.ones(s, s, dtype=torch.bool, device=x.device).tril()
+            attn_out = scaled_dot_product_attention(q, k, v, mask) # [b, h, s, d]
+
         out = attn_out.transpose(1, 2).reshape(b, s, self.d_model)
         return self.o_proj(out)
         
@@ -232,6 +245,7 @@ class TransformerBlock(nn.Module):
                  d_ff: int,
                  theta: float,
                  max_seq_len: int,
+                 use_sdpa: bool = False,
                  device: Optional[Union[str, torch.device]] = None, 
                  dtype: Optional[torch.dtype] = None):
         super().__init__()
@@ -239,7 +253,7 @@ class TransformerBlock(nn.Module):
         self.ln1 = RMSNorm(d_model=d_model)
         self.ln2 = RMSNorm(d_model=d_model)
         self.rope = RotaryPositionalEmbedding(theta=theta, head_dim=self.head_dim, max_seq_len=max_seq_len, device=device, dtype=dtype)
-        self.attn = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, rope=self.rope, device=device, dtype=dtype)
+        self.attn = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, rope=self.rope, device=device, dtype=dtype, use_sdpa=use_sdpa)
         self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff, device=device, dtype=dtype)
 
     def forward(self, x):
@@ -257,6 +271,7 @@ class Transformer(nn.Module):
                  num_heads: int,
                  d_ff: int,
                  theta: float,
+                 use_sdpa: bool = False,
                  device: Optional[Union[str, torch.device]] = None, 
                  dtype: Optional[torch.dtype] = None):
         super().__init__()
@@ -276,7 +291,8 @@ class Transformer(nn.Module):
                 theta=self.theta,
                 max_seq_len=self.context_length,
                 device=device,
-                dtype=dtype
+                dtype=dtype,
+                use_sdpa=use_sdpa
             ) for _ in torch.arange(num_layers, device=device)
         ])
         self.ln_final = RMSNorm(self.d_model)

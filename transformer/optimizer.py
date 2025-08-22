@@ -1,5 +1,6 @@
 import math
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from jaxtyping import Float, Int
 from typing import Optional, Callable, Tuple
@@ -7,15 +8,14 @@ from typing import Optional, Callable, Tuple
 
 def cross_entropy(logits: Float[Tensor, "... vocab_size"], 
                   targets: Int[Tensor, "..."]) -> Float[Tensor, ""]:
-    """Implement numerically stable cross-entropy loss from scratch"""
-    # Numerical stability: subtract max logit per batch element
-    logits_max = logits.max(dim=-1, keepdim=True).values
-    logits_shifted = logits - logits_max
-    log_sum_exp = torch.log(torch.exp(logits_shifted).sum(dim=-1))
-    # Select logits corresponding to the target indices (shape: batch_size seq_len)
-    target_logits = logits_shifted.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
-    # Compute loss
-    nll = log_sum_exp - target_logits
+    """Numerically stable cross-entropy in float32."""
+    # Upcast to float32 for stable exp/log even if logits came from bf16 autocast
+    logits_f32 = logits.float()
+    # logsumexp across vocab
+    lse = torch.logsumexp(logits_f32, dim=-1)
+    # Gather the target logits
+    tgt = logits_f32.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    nll = lse - tgt
     return nll.mean()
 
 
@@ -37,6 +37,11 @@ def gradient_clipping(params, max_l2_norm: float, eps: Optional[float] = 1e-6):
         if p.grad is None:
             continue
         total_norm_sq += p.grad.detach().float().pow(2).sum()
+
+    # Use global norm across ranks if distributed
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(total_norm_sq, op=dist.ReduceOp.SUM)
+
     total_norm = total_norm_sq.sqrt()
 
     if total_norm > max_l2_norm:
