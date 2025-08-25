@@ -80,3 +80,5 @@ torchrun --nproc_per_node=4 -m transformer.train \
   --outdir checkpoints \
   --weights_only
 ```
+
+Inspired by the assignments from the [CS336 Standford Course](https://stanford-cs336.github.io/spring2025/).
